@@ -9,10 +9,24 @@ import streamlit as st
 
 from filter_exact_no_match import extract_text, SKIP_SCORES, VALID_MATCH_TYPES
 
+VERSION = "1.0.0"
+
 UPDATE_URLS = {
     "app.py": "https://raw.githubusercontent.com/AhmedAbdLMoaty/QA-shortcut/main/app.py",
     "filter_exact_no_match.py": "https://raw.githubusercontent.com/AhmedAbdLMoaty/QA-shortcut/main/filter_exact_no_match.py",
 }
+
+
+@st.cache_data(ttl=10)
+def check_remote_version() -> str | None:
+    try:
+        with urllib.request.urlopen(UPDATE_URLS["app.py"], timeout=5) as r:
+            for line in r.read().decode("utf-8", errors="replace").splitlines():
+                if line.startswith("VERSION"):
+                    return line.split('"')[1]
+    except Exception:
+        pass
+    return None
 
 CLAUDE_MODELS = [
     "claude-opus-4-7",
@@ -157,6 +171,11 @@ with st.sidebar:
 
     st.divider()
     st.header("App Updates")
+    remote_version = check_remote_version()
+    if remote_version and remote_version != VERSION:
+        st.warning(f"Update available: v{remote_version}")
+    else:
+        st.caption(f"v{VERSION} — up to date")
     if all(UPDATE_URLS.values()):
         if st.button("Update App"):
             errors = []
