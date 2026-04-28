@@ -20,6 +20,23 @@ CLAUDE_MODELS = [
     "claude-haiku-4-5",
 ]
 
+TRIAGE_SYSTEM = """You are an expert translation QA specialist.
+
+You will receive a list of terminology error entries from a translation quality check report.
+For each entry, classify it as exactly one of:
+- Real error: the wrong term was genuinely used and must be fixed
+- False positive: the flag is overzealous; the translation is contextually acceptable
+- Duplicate: same term error already appears in another entry in this batch
+- Ambiguous: cannot determine without more context; needs human review
+
+Reply ONLY with a JSON array. Each element must have these keys:
+  "entry": the entry number (integer)
+  "segmentId": the segmentId string
+  "verdict": one of: Real error, False positive, Duplicate, Ambiguous
+  "reason": one short sentence explaining the verdict
+
+Do not include any text outside the JSON array."""
+
 
 def parse_report(raw: str, match_types: set) -> list:
     marker = '"gs4trTranscheckReportData"'
@@ -88,34 +105,43 @@ def to_txt_bytes(rows: list, match_types: set) -> bytes:
     return "".join(lines).encode("utf-8")
 
 
+def build_entry_context(rows: list) -> str:
+    lines = []
+    for i, r in enumerate(rows, 1):
+        lines.append(
+            f"Entry {i} | segmentId={r['segmentId']} | matchType={r['matchType']} | score={r['score']}\n"
+            f"  Source term     : {r['sourceTerm']}\n"
+            f"  Expected target : {r['expectedTargetTerm']}\n"
+            f"  Source text     : {r['source']}\n"
+            f"  Target text     : {r['target']}\n"
+            f"  Comment         : {r['comment']}\n"
+        )
+    return "\n".join(lines)
+
+
+def triage_with_claude(api_key: str, model: str, rows: list) -> list:
+    import anthropic
+    context = build_entry_context(rows)
+    client = anthropic.Anthropic(api_key=api_key)
+    message = client.messages.create(
+        model=model,
+        max_tokens=4096,
+        system=TRIAGE_SYSTEM,
+        messages=[{"role": "user", "content": context}],
+    )
+    return json.loads(message.content[0].text)
+
+
 def analyze_with_claude(api_key: str, model: str, rows: list, user_prompt: str) -> str:
     import anthropic
-
-    context_lines = []
-    for i, r in enumerate(rows, 1):
-        context_lines.append(
-            f"Entry {i} [{r['matchType']}] segmentId={r['segmentId']}\n"
-            f"  Source term      : {r['sourceTerm']}\n"
-            f"  Expected target  : {r['expectedTargetTerm']}\n"
-            f"  Source text      : {r['source']}\n"
-            f"  Target text      : {r['target']}\n"
-            f"  Comment          : {r['comment']}\n"
-        )
-
-    context = "\n".join(context_lines)
+    context = build_entry_context(rows)
     system = "You are an expert translation QA specialist. Analyze the provided terminology error entries from a translation quality check report and answer the user's question clearly and concisely."
-
     client = anthropic.Anthropic(api_key=api_key)
     message = client.messages.create(
         model=model,
         max_tokens=2048,
         system=system,
-        messages=[
-            {
-                "role": "user",
-                "content": f"Here are the terminology error entries:\n\n{context}\n\nUser question: {user_prompt}",
-            }
-        ],
+        messages=[{"role": "user", "content": f"{context}\n\nUser question: {user_prompt}"}],
     )
     return message.content[0].text
 
@@ -166,6 +192,7 @@ if run and uploaded and selected_types:
             st.session_state["rows"] = rows
             st.session_state["selected_types"] = set(selected_types)
             st.session_state["stem"] = uploaded.name.rsplit(".", 1)[0]
+            st.session_state.pop("triage", None)
         except ValueError as e:
             st.error(str(e))
             st.stop()
@@ -198,35 +225,75 @@ if "rows" in st.session_state and st.session_state["rows"] is not None:
             )
 
         st.divider()
-        st.subheader("AI Analysis with Claude")
+        st.subheader("Claude AI")
 
-        analyze_count = st.slider(
-            "Number of entries to send to Claude",
-            min_value=1,
-            max_value=len(rows),
-            value=min(20, len(rows)),
-        )
+        tab_triage, tab_ask = st.tabs(["Triage entries", "Ask a question"])
 
-        user_prompt = st.text_area(
-            "Your question or instruction",
-            placeholder="e.g. Summarize the most common errors and suggest fixes.",
-            height=120,
-        )
+        with tab_triage:
+            st.caption(
+                "Claude reads every entry and classifies it as "
+                "**Real error**, **False positive**, **Duplicate**, or **Ambiguous**."
+            )
+            triage_count = st.slider(
+                "Entries to triage",
+                min_value=1,
+                max_value=len(rows),
+                value=min(30, len(rows)),
+            )
+            if st.button("Run Triage"):
+                if not api_key:
+                    st.warning("Enter your Claude API key in the sidebar first.")
+                else:
+                    with st.spinner(f"Triaging {triage_count} entries with {model}..."):
+                        try:
+                            results = triage_with_claude(api_key, model, rows[:triage_count])
+                            st.session_state["triage"] = results
+                        except Exception as e:
+                            st.error(f"Claude API error: {e}")
 
-        analyze_btn = st.button(
-            "Analyze with Claude",
-            disabled=not user_prompt,
-        )
+            if "triage" in st.session_state:
+                triage_df = pd.DataFrame(st.session_state["triage"])
+                verdict_order = ["Real error", "Duplicate", "Ambiguous", "False positive"]
+                triage_df["_order"] = triage_df["verdict"].apply(
+                    lambda v: verdict_order.index(v) if v in verdict_order else 99
+                )
+                triage_df = triage_df.sort_values("_order").drop(columns="_order").reset_index(drop=True)
 
-        if analyze_btn:
-            if not api_key:
-                st.warning("Enter your Claude API key in the sidebar first.")
-            else:
-                with st.spinner(f"Sending {analyze_count} entries to {model}..."):
-                    try:
-                        result = analyze_with_claude(api_key, model, rows[:analyze_count], user_prompt)
-                        st.markdown(result)
-                    except Exception as e:
-                        st.error(f"Claude API error: {e}")
+                verdict_counts = triage_df["verdict"].value_counts()
+                cols = st.columns(len(verdict_counts))
+                for col, (verdict, count) in zip(cols, verdict_counts.items()):
+                    col.metric(verdict, count)
+
+                st.dataframe(triage_df, use_container_width=True, hide_index=True)
+
+                st.download_button(
+                    "Download Triage CSV",
+                    data=triage_df.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"{stem}_{suffix}_triage.csv",
+                    mime="text/csv",
+                )
+
+        with tab_ask:
+            user_prompt = st.text_area(
+                "Your question or instruction",
+                placeholder="e.g. Which errors are most critical to fix first?",
+                height=120,
+            )
+            analyze_count = st.slider(
+                "Entries to send",
+                min_value=1,
+                max_value=len(rows),
+                value=min(30, len(rows)),
+            )
+            if st.button("Ask Claude", disabled=not user_prompt):
+                if not api_key:
+                    st.warning("Enter your Claude API key in the sidebar first.")
+                else:
+                    with st.spinner(f"Sending {analyze_count} entries to {model}..."):
+                        try:
+                            result = analyze_with_claude(api_key, model, rows[:analyze_count], user_prompt)
+                            st.markdown(result)
+                        except Exception as e:
+                            st.error(f"Claude API error: {e}")
     else:
         st.info("No entries matched the selected filter(s).")
