@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=QA Filter
+Comment=TranscheckReport Filter Tool
+Exec=bash -c "cd /home/$USER/QA-shortcut && python3 -m streamlit run app.py"
+Icon=utilities-terminal
+Terminal=true
+Categories=Utility;
