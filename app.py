@@ -15,12 +15,9 @@ UPDATE_URLS = {
 }
 
 CLAUDE_MODELS = [
-    "claude-opus-4-5",
-    "claude-sonnet-4-5",
+    "claude-opus-4-7",
+    "claude-sonnet-4-6",
     "claude-haiku-4-5",
-    "claude-opus-4-0",
-    "claude-3-5-sonnet-20241022",
-    "claude-3-5-haiku-20241022",
 ]
 
 
