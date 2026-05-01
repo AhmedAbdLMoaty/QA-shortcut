@@ -195,6 +195,57 @@ def tree_to_bytes(tree) -> bytes:
     return buf.getvalue()
 
 
+def check_translations(segments: list) -> list:
+    issues = []
+    for seg in segments:
+        if not seg.get("translated"):
+            continue
+        seg_id = seg["id"]
+        source = seg["source"]
+        target = seg["target"]
+
+        source_phs = set(re.findall(r"\{ph:\d+\}", source))
+        target_phs = set(re.findall(r"\{ph:\d+\}", target))
+        missing_phs = source_phs - target_phs
+        extra_phs = target_phs - source_phs
+        if missing_phs:
+            issues.append({"id": seg_id, "severity": "Critical", "check": "Missing placeholder", "detail": f"Lost: {', '.join(sorted(missing_phs))}", "source": source, "target": target})
+        if extra_phs:
+            issues.append({"id": seg_id, "severity": "Critical", "check": "Extra placeholder", "detail": f"Added: {', '.join(sorted(extra_phs))}", "source": source, "target": target})
+
+        if not target.strip():
+            issues.append({"id": seg_id, "severity": "Critical", "check": "Empty translation", "detail": "Translation is blank", "source": source, "target": target})
+            continue
+
+        if source.strip() and target.strip() == source.strip():
+            issues.append({"id": seg_id, "severity": "Warning", "check": "Untranslated", "detail": "Target identical to source", "source": source, "target": target})
+
+        src_len = len(source.strip())
+        tgt_len = len(target.strip())
+        if src_len > 10:
+            ratio = tgt_len / src_len
+            if ratio < 0.25:
+                issues.append({"id": seg_id, "severity": "Warning", "check": "Too short", "detail": f"Length ratio {ratio:.2f} (target {tgt_len} chars vs source {src_len})", "source": source, "target": target})
+            elif ratio > 4.0:
+                issues.append({"id": seg_id, "severity": "Warning", "check": "Too long", "detail": f"Length ratio {ratio:.2f} (target {tgt_len} chars vs source {src_len})", "source": source, "target": target})
+
+        src_numbers = set(re.findall(r"\b\d+\b", source))
+        tgt_numbers = set(re.findall(r"\b\d+\b", target))
+        lost_numbers = src_numbers - tgt_numbers
+        if lost_numbers:
+            issues.append({"id": seg_id, "severity": "Warning", "check": "Lost numbers", "detail": f"Numbers in source not in target: {', '.join(sorted(lost_numbers))}", "source": source, "target": target})
+
+        words = target.split()
+        if len(words) >= 6:
+            for i in range(len(words) - 4):
+                chunk = words[i:i+3]
+                if words[i+3:i+6] == chunk:
+                    issues.append({"id": seg_id, "severity": "Critical", "check": "Repetition loop", "detail": f"Repeated phrase detected: '{' '.join(chunk)}'", "source": source, "target": target})
+                    break
+
+    return issues
+
+
 st.set_page_config(page_title="TXLF Editor", layout="wide")
 st.title("TXLF Segment Editor & Translator")
 
@@ -344,6 +395,10 @@ if to_translate:
 
             existing = st.session_state.get("txlf_translated_ids", set())
             st.session_state["txlf_translated_ids"] = existing | set(translations.keys())
+
+            translated_segs = [s for s in st.session_state["txlf_segments"] if s["id"] in translations]
+            qa_issues = check_translations(translated_segs)
+            st.session_state["qa_issues"] = qa_issues
             st.rerun()
 
         except Exception as e:
@@ -359,3 +414,35 @@ if st.session_state.get("txlf_translated_ids"):
         file_name=f"{stem}_translated.txlf",
         mime="application/xml",
     )
+
+    qa_issues = st.session_state.get("qa_issues", [])
+    st.divider()
+    st.subheader(f"Translation QA — {len(qa_issues)} issue(s) found")
+    if not qa_issues:
+        st.success("No issues detected. All placeholders preserved, lengths look normal, no repetition loops.")
+    else:
+        critical = [i for i in qa_issues if i["severity"] == "Critical"]
+        warnings = [i for i in qa_issues if i["severity"] == "Warning"]
+        col1, col2 = st.columns(2)
+        col1.metric("Critical", len(critical))
+        col2.metric("Warning", len(warnings))
+        issues_df = pd.DataFrame(qa_issues)[["severity", "id", "check", "detail", "source", "target"]]
+        st.dataframe(
+            issues_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "severity": st.column_config.TextColumn("Severity", width="small"),
+                "id": st.column_config.TextColumn("ID", width="small"),
+                "check": st.column_config.TextColumn("Check", width="medium"),
+                "detail": st.column_config.TextColumn("Detail", width="large"),
+                "source": st.column_config.TextColumn("Source", width="large"),
+                "target": st.column_config.TextColumn("Translation", width="large"),
+            },
+        )
+        st.download_button(
+            "Download QA Issues CSV",
+            data=issues_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"{stem}_qa_issues.csv",
+            mime="text/csv",
+        )
